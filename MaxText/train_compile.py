@@ -36,7 +36,6 @@ from layers import models
 from layers import quantizations
 from typing import Sequence
 from absl import app
-import os
 import pickle
 import accelerator_to_spec_map
 import train
@@ -56,21 +55,13 @@ def validate_config(config):
 def get_topology_mesh(config):
   """Get the target hardware devices, and create configured mesh with them"""
   target_hardware = accelerator_to_spec_map.get_system_characteristics(config.compile_topology)
-  if target_hardware.platform == 'gpu':
-    # Disable sharded autotuning. This is an optimization to distribute
-    # autotuning across the fleet, but can cause hangs with AoT compilation.
-    os.environ['XLA_FLAGS'] = os.environ.get('XLA_FLAGS', '') + ' --xla_gpu_shard_autotuning=false'
-    jax.config.update('mock_num_gpu_processes', config.compile_topology_num_slices)
-    topology_devices = jax.devices()
-  else:
-    topology_devices = get_topology_desc(
-        platform=target_hardware.platform,
-        topology_name=target_hardware.topology_name,
-        chip_config_name=target_hardware.chip_config_name,
-        chips_per_host_bounds=target_hardware.chips_per_host_bounds,
-        num_slices=config.compile_topology_num_slices,
-        wrap=target_hardware.wrap,
-    ).devices
+  topology_devices = get_topology_desc(
+      platform=target_hardware.platform,
+      topology_name=target_hardware.topology_name,
+      chip_config_name=target_hardware.chip_config_name,
+      chips_per_host_bounds=target_hardware.chips_per_host_bounds,
+      num_slices=config.compile_topology_num_slices,
+  ).devices
   topology_device_mesh = max_utils.create_device_mesh(config, topology_devices)
   topology_mesh = Mesh(topology_device_mesh, config.mesh_axes)
   return topology_mesh
@@ -112,6 +103,16 @@ def jit_and_compile(
     logical_axis_rules,
 ):
   """Jit, lower, and compile func."""
+  print(f"MFR: mesh = {mesh}")
+  print(f"MFR: func = {func}")
+  print(f"MFR: func_input_args = {func_input_args}")
+  print(f"MFR: func_input_kwargs = {func_input_kwargs}")
+  print(f"MFR: in_shardings = {in_shardings}")
+  print(f"MFR: out_shardings = {out_shardings}")
+  print(f"MFR: static_argnums = {static_argnums}")
+  print(f"MFR: donate_argnums = {donate_argnums}")
+  print(f"MFR: logical_axis_rules = {logical_axis_rules}")
+
   with mesh, logical_axis_rules:
     jitted = jax.jit(
         func,
@@ -134,28 +135,34 @@ def save_compiled(compiled, save_name):
 
 def main(argv: Sequence[str]) -> None:
   jax.config.update("jax_default_prng_impl", "unsafe_rbg")
-  os.environ["LIBTPU_INIT_ARGS"] = os.environ.get("LIBTPU_INIT_ARGS", "") + " --xla_tpu_spmd_rng_bit_generator_unsafe=true"
   print("Starting train_compile.py...", flush=True)
 
   # Parse and validate configuration
   pyconfig.initialize(argv)
   config = pyconfig.config
-  validate_config(config)
+  #validate_config(config)
 
   # Create target mesh
-  topology_mesh = get_topology_mesh(config)
+  #topology_mesh = get_topology_mesh(config)
+  devices_array = max_utils.create_device_mesh(config)
+  topology_mesh = Mesh(devices_array, config.mesh_axes)
 
-  # Print system information after building the compile topology to avoid
-  # prematurely initializing the backend.
-  max_utils.print_system_information()
+
+  print(f"MFR: topology_mesh = {topology_mesh}")
 
   # Get shaped inputs
   shaped_train_args, shaped_train_kwargs, state_mesh_annotations, model = get_shaped_inputs(topology_mesh, config)
+  print(f"MFR: shaped_train_args = {shaped_train_args}")
+  print(f"MFR: shaped_train_kwargs = {shaped_train_kwargs}")
+  print(f"MFR: state_mesh_annotations = {state_mesh_annotations}")
 
   # Get function to compile and shardings
   func_to_compile, in_shard, out_shard, static_argnums, donate_argnums = maxtext_utils.get_functional_train_with_signature(
       train.train_step, topology_mesh, state_mesh_annotations, model, config
   )
+  
+  print(f"in_shard = {in_shard}")
+  print(f"out_shard = {out_shard}")
 
   # Compile
   print("Jitting and compiling train step...", flush=True)
@@ -171,6 +178,10 @@ def main(argv: Sequence[str]) -> None:
       nn_partitioning.axis_rules(config.logical_axis_rules),
   )
   print("Jitting and compilation complete!", flush=True)
+
+  print(f"MFR: compiled.input_shardings[0] {compiled.input_shardings[0]}")
+  print(f"MFR: compiled.output_shardings[0] {compiled.output_shardings[0]}")
+
 
   # Serialize and save the compiled object
   if config.compiled_trainstep_file != "":

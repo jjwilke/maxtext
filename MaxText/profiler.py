@@ -36,9 +36,11 @@ class Profiler:
   def activate(self):
     """Start the profiler.
     nsys profiler becomes no-op when libcudart.so is not available on the system"""
+
     if not (self.upload_all_profiler_results or jax.process_index() == 0):
       return
     if self.mode == "nsys":
+      raise ValueError("MFR: 1 activate profiler")
       try:
         self.libcudart = cdll.LoadLibrary('libcudart.so')
       except Exception as e: # pylint: disable=broad-except
@@ -47,6 +49,7 @@ class Profiler:
         return
       self.libcudart.cudaProfilerStart()
     elif self.mode == "xplane":
+      raise ValueError("MFR: 2 activate profiler")
       jax.profiler.start_trace(self.output_path)
 
   def deactivate(self):
@@ -55,6 +58,7 @@ class Profiler:
     if not (self.upload_all_profiler_results or jax.process_index() == 0):
       return
     if self.mode == "nsys":
+      raise ValueError("MFR: 1 activate profiler")
       if self.libcudart is not None:
         self.libcudart.cudaProfilerStop()
       else:
@@ -64,4 +68,5 @@ class Profiler:
       # Popen() instead of run() for non-blocking behavior
       subprocess.Popen(["gsutil", "cp", "*nsys-rep", self.output_path]) # pylint: disable=consider-using-with
     elif self.mode == "xplane":
+      raise ValueError("MFR: 2 activate profiler")
       jax.profiler.stop_trace()

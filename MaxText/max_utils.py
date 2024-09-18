@@ -29,6 +29,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from jax.experimental import mesh_utils
+from jax.experimental.pjit import pjit
 import orbax.checkpoint as ocp
 import orbax.checkpoint.experimental.emergency.checkpoint_manager as emergency_checkpoint_manager
 
@@ -102,13 +103,15 @@ def summarize_size_from_pytree(params):
 def initialize_summary_writer(config):
   return (
       writer.SummaryWriter(config.tensorboard_dir)
-      if jax.process_index() == 0
+      #if jax.process_index() == 0
+      if False
       else None
   )
 
 
 def close_summary_writer(summary_writer):
-  if jax.process_index() == 0:
+  #if jax.process_index() == 0:
+  if False:
     summary_writer.close()
 
 
@@ -136,14 +139,16 @@ def write_metrics_locally(metrics, step, config, file):
 
 def add_config_to_summary_writer(config, summary_writer):
   """Writes config params to tensorboard"""
-  if jax.process_index() == 0:
+  #if jax.process_index() == 0:
+  if False:
     for key, value in config.get_keys().items():
       add_text_to_summary_writer(key, str(value), summary_writer)
 
 
 def add_text_to_summary_writer(key, value, summary_writer):
   """Writes given key-value pair to tensorboard as text/summary"""
-  if jax.process_index() == 0:
+  #if jax.process_index() == 0:
+  if False:
     summary_writer.add_text(key, value)
 
 
@@ -171,6 +176,7 @@ def write_config_raw_keys_for_gcs(raw_keys):
   """Writes config raw keys to GCS"""
   if not raw_keys["save_config_to_gcs"] or jax.process_index() != 0:
     return
+  return
   max_logging.log("Writing config to GCS...")
 
   raw_keys_dict = dict(raw_keys)
@@ -238,6 +244,12 @@ def maybe_initialize_jax_distributed_system(raw_keys):
     else:
       initialize_jax_for_tpu_with_emergency_checkpointing(raw_keys)
     max_logging.log("Jax distributed system initialized!")
+
+  max_logging.log(f"JAX process: {jax.process_index()} / {jax.process_count()}")
+  max_logging.log(f"JAX devices: {jax.devices()}")
+  max_logging.log(f"jax.device_count(): {jax.device_count()}")
+  max_logging.log(f"jax.local_device_count(): {jax.local_device_count()}")
+  max_logging.log(f"jax.process_count(): {jax.process_count()}")
 
 
 def initialize_jax_for_gpu():
@@ -438,6 +450,11 @@ def create_device_mesh(config, devices=None):
 
   max_logging.log(f"Num_devices: {num_devices}, shape {mesh.shape}")
 
+  print(f"MFR: num_slices={num_slices}")
+  print(f"MFR: dcn_parallelism={dcn_parallelism}")
+  print(f"MFR: ici_parallelism={ici_parallelism}")
+  print(f"MFR: mesh={mesh}")
+
   return mesh
 
 
@@ -529,6 +546,44 @@ def setup_decode_state(model, config, rng, mesh, checkpoint_manager):
   return state, state_mesh_annotations
 
 
+def bind_mesh(pjitted_fn, global_mesh: jax.sharding.Mesh):
+  """Wraps a pjitted_fn with a mesh context."""
+
+  def call(*args):
+    with global_mesh:
+      return pjitted_fn(*args)
+
+  def lower(*args, **kwargs):
+    with global_mesh:
+      return pjitted_fn.lower(*args, **kwargs)
+
+  call.lower = lower
+  return call
+
+
+def initialize_state_with_sharding2(init_state_partial, mesh, state_sharding, rng_sharding, rng):
+
+  with mesh:
+    jitted = pjit(
+        init_state_partial,
+        in_shardings=rng_sharding,
+        out_shardings=state_sharding,
+    )
+  jitted = bind_mesh(jitted, mesh)
+
+  state = jitted(rng)
+
+  print(f"MFR: state={state}")
+
+  state = unbox_logicallypartioned(state)
+  return state
+
+def initialize_state_with_sharding(init_state_partial, sharding, rng):
+  state = jax.jit(init_state_partial, in_shardings=None, out_shardings=sharding)(rng)
+  state = unbox_logicallypartioned(state)
+  return state
+
+
 def setup_training_state(
     model, data_iterator, tx, config, rng, mesh, checkpoint_manager
 ):
@@ -543,6 +598,50 @@ def setup_training_state(
       checkpoint_manager,
       is_training,
   )
+
+def get_abstract_state_no_sharding(model, tx, config, rng, mesh, is_training=True):
+  """Get a shaped abstraction of the state (including optimizer)"""
+  init_state_partial = functools.partial(init_initial_state, model, tx, config, is_training)
+ 
+  #print(f"MFR: init_state_partial = {init_state_partial}")
+  #print(f"MFR: abstract_state0 = {jax.eval_shape(init_state_partial, rng)}")
+  with nn_partitioning.axis_rules(config.logical_axis_rules):
+    abstract_state = jax.eval_shape(init_state_partial, rng)
+ 
+  state_logical_annotations = nn.get_partition_spec(abstract_state)
+  with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
+    state_mesh_annotations = nn.logical_to_mesh(state_logical_annotations)
+ 
+  abstract_state = unbox_logicallypartioned(abstract_state)
+  #print(f"MFR: abstract_state = {abstract_state}")
+  #print(f"MFR: state_mesh_annotations = {state_mesh_annotations}")
+  return init_state_partial, abstract_state, state_mesh_annotations
+ 
+def get_abstract_state_with_sharding(model, tx, config, rng, mesh, is_training=True):
+  """Get a shaped abstraction of the state (including optimizer)"""
+  init_state_partial = functools.partial(init_initial_state, model, tx, config, is_training)
+ 
+  #print(f"MFR: init_state_partial = {init_state_partial}")
+  #print(f"MFR: abstract_state0 = {jax.eval_shape(init_state_partial, rng)}")
+  with nn_partitioning.axis_rules(config.logical_axis_rules):
+    abstract_state = jax.eval_shape(init_state_partial, rng)
+ 
+  state_logical_annotations = nn.get_partition_spec(abstract_state)
+ 
+  state_mesh_shardings = nn.logical_to_mesh_sharding(state_logical_annotations, mesh, config.logical_axis_rules)
+ 
+  abstract_sharded_state = jax.jit(init_state_partial, in_shardings=None, out_shardings=state_mesh_shardings).eval_shape(rng)
+ 
+  unboxed_abstract_sharded_state = unbox_logicallypartioned(abstract_sharded_state)
+   
+  with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
+    state_mesh_annotations = nn.logical_to_mesh(state_logical_annotations)
+
+  abstract_state = unbox_logicallypartioned(abstract_state)
+  #print(f"MFR: abstract_state = {abstract_state}")
+  #print(f"MFR: state_mesh_annotations = {state_mesh_annotations}")
+  return init_state_partial, unboxed_abstract_sharded_state, state_mesh_annotations
+
 
 
 def setup_initial_state(

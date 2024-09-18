@@ -111,6 +111,8 @@ def create_orbax_emergency_checkpoint_manager(
 def _find_idx(array: np.ndarray, replica_axis_idx: int):
   """Returns the index along given dimension that the current host belongs to."""
   idx = None
+  raise ValueError("MFR: find_idx")
+
   for idx, val in np.ndenumerate(array):
     if val.process_index == jax.process_index():
       break
