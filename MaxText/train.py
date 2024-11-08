@@ -26,11 +26,7 @@ import sys
 import functools
 import time
 
-<<<<<<< HEAD
-from typing import Sequence, Optional
-=======
 from typing import Optional, Sequence
->>>>>>> 6b42eab4... single train.py, clean up run.py
 from absl import app
 from flax import linen as nn
 from flax.linen import partitioning as nn_partitioning
@@ -577,10 +573,10 @@ def setup_train_loop(config):
   #    model, data_iterator, tx, config, init_rng, mesh, checkpoint_manager
   #)
 
-  if not config.using_pipeline_parallelism:
-    # The vocab tensor(s) of shape [vocab, embed] (and transpose) are not sharded by stage
-    maxtext_utils.assert_params_sufficiently_sharded(state.params, mesh, tolerance=0.02)
-  record_goodput(recorder, config, recorder.record_training_preparation_end_time if recorder else None)
+  #if not config.using_pipeline_parallelism:
+  #  # The vocab tensor(s) of shape [vocab, embed] (and transpose) are not sharded by stage
+  #  maxtext_utils.assert_params_sufficiently_sharded(state.params, mesh, tolerance=0.02)
+  #record_goodput(recorder, config, recorder.record_training_preparation_end_time if recorder else None)
 
   # Shaped RNG keys
   _, example_rng = jax.random.split(jax.random.PRNGKey(0), 2)
