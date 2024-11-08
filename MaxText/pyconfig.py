@@ -227,10 +227,20 @@ def validate_model_name(s: str) -> bool:
       "gpt3-22b",
       "gpt3-6b",
       "gpt3-52k",
+      "gpt3-xl",
+      "gpt3-24layers",
   )
   if s not in valid_model_names:
     raise ValueError(f"Invalid model name was passed. Got {s}, Valid options {valid_model_names}")
 
+def validate_overrides_consistent(keys1: list[str], keys2: list[str], raw_keys: dict, raw_keys_old: dict):
+  overwritten_keys = [k for k in keys1 if k in keys2]
+  for key in overwritten_keys:
+      if raw_keys_old[key] != raw_keys[key]:
+          raise ValueError(
+              f"Key {key} inconsistently overwritten by argument({raw_keys_old[key]})"
+              f" and model({raw_keys[key]}). This isn't allowed."
+          )
 
 def validate_no_keys_overwritten_twice(keys1: list[str], keys2: list[str]):
   overwritten_keys = [k for k in keys1 if k in keys2]
@@ -370,9 +380,12 @@ class _HyperParameters:
     raw_keys = OrderedDict()
     keys_from_env_and_command_line = self._update_from_env_and_command_line(raw_keys, raw_data_from_yaml, argv, **kwargs)
     max_logging.log(f"Updating keys from env and command line: {keys_from_env_and_command_line}")
+    raw_keys_before_model = raw_keys.copy()
     keys_from_model = _HyperParameters.update_model_vars(argv[1], raw_keys, config_name)
     max_logging.log(f"Updating keys from model: {keys_from_model}")
-    validate_no_keys_overwritten_twice(keys_from_env_and_command_line, keys_from_model)
+
+    validate_overrides_consistent(keys_from_env_and_command_line, keys_from_model, raw_keys, raw_keys_before_model)
+    #validate_no_keys_overwritten_twice(keys_from_env_and_command_line, keys_from_model)
 
     # This must be invoked before initializing the backend
     raw_keys = validate_and_set_hlo_dump_defaults(raw_keys)
@@ -468,7 +481,7 @@ class _HyperParameters:
     raw_keys["num_slices"] = max_utils.get_num_slices(raw_keys)
     raw_keys["quantization_local_shard_count"] = get_quantization_local_shard_count(raw_keys)
     raw_keys = create_parallelisms_list(raw_keys)
-    raw_keys = set_and_validate_pipeline_config(raw_keys)
+    #raw_keys = set_and_validate_pipeline_config(raw_keys)
 
     if raw_keys["dataset_type"] == "c4_mlperf":
       raw_keys["add_bos"] = False

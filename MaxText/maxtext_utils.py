@@ -19,9 +19,17 @@ limitations under the License.
 
 import jax
 import optax
+import optimizers
 import max_utils
 from jax.sharding import PartitionSpec as P
 from jax.experimental.serialize_executable import deserialize_and_load
+from flax.linen import partitioning as nn_partitioning
+from jax.experimental.pjit import pjit, AUTO
+
+try:
+  from legate.jax import MeshWrapper
+except ImportError:
+  pass
 
 
 import pickle
@@ -30,6 +38,109 @@ from input_pipeline import input_pipeline_interface
 
 OVERWRITE_WITH_GRADIENT = "_overwrite_with_gradient"
 
+def bind_mesh(pjitted_fn, global_mesh: jax.sharding.Mesh):
+  """Wraps a pjitted_fn with a mesh context."""
+
+  def call(*args):
+    with global_mesh:
+      return pjitted_fn(*args)
+
+  def lower(*args, **kwargs):
+    with global_mesh:
+      return pjitted_fn.lower(*args, **kwargs)
+
+  call.lower = lower
+  return call
+
+
+
+def jit_and_compile(
+    func,
+    func_input_args,
+    func_input_kwargs,
+    mesh,
+    in_shardings,
+    out_shardings,
+    static_argnums,
+    donate_argnums,
+):
+  """Jit, lower, and compile func."""
+  jitted = pjit(
+      func,
+      in_shardings=in_shardings,
+      out_shardings=out_shardings,
+      static_argnums=static_argnums,
+      donate_argnums=donate_argnums,
+  )
+
+  jitted = bind_mesh(jitted, mesh)
+
+  with MeshWrapper.lower_mode():
+    lowered = jitted.lower(*func_input_args, **func_input_kwargs)
+  with MeshWrapper.compile_mode():
+    compiled = lowered.compile()
+
+  sharding_str_arr = []
+  def check(inp, inp_sharding, out):
+    sharding_str_arr.append(f"shape={inp.shape} input={inp_sharding} output={out}")
+    if not inp_sharding.is_equivalent_to(out, len(inp.shape)):
+      raise Exception("\n".join(sharding_str_arr) + " mismatch")
+
+  jax.tree_map(check, func_input_args[0], compiled.input_shardings[0][0], compiled.output_shardings[0])
+
+  return compiled
+
+def get_and_compile_functional_train_with_signature(train_step, mesh, state_mesh_annotations, model, config, shaped_train_args):
+  """Get the shardings (both state and data) for train_step"""
+  transformer_shape = [(size if (name != 'stage') else 1) for name, size in mesh.shape.items()]
+  mesh = MeshWrapper(mesh, transformer_shape)
+
+  def canonicalize_sharding(p):
+    if isinstance(p, jax.sharding.GSPMDSharding):
+      return p
+    return AUTO(mesh)
+
+  state_mesh_shardings = jax.tree_util.tree_map(canonicalize_sharding, state_mesh_annotations)
+
+  functional_train = get_functional_train_step(train_step, model, config, state_mesh_shardings)
+  functional_train.__name__ = "train_step"
+  data_pspec = P(*config.data_sharding)
+
+  data_sharding = jax.tree_util.tree_map(lambda p: jax.sharding.NamedSharding(mesh, p), data_pspec)
+  in_shardings = (state_mesh_shardings, data_sharding, None)  # State, batch, rng
+
+  out_shardings = (state_mesh_shardings, None)
+
+   # get shapes from config
+  #shaped_train_args, shaped_train_kwargs = get_shaped_inputs(mesh, model, config)
+  shaped_train_kwargs = {}
+
+  static_argnums = ()  # We partial out the static argnums of model and config
+  donate_argnums = 0  # This is the index of the state - we allow the compiler to make use of this memory.
+
+  from jax.lax import with_sharding_constraint
+  from legate.jax import autoshard
+  def autoshard_train_fn(train_state, *args):
+    sharded_train_state = jax.tree_map(lambda x, y: with_sharding_constraint(x, y), train_state, state_mesh_annotations)
+    return functional_train(sharded_train_state, *args)
+
+  with mesh, autoshard(True), nn_partitioning.axis_rules(config.logical_axis_rules):
+    compiled = jit_and_compile(
+        autoshard_train_fn,
+        shaped_train_args,
+        shaped_train_kwargs,
+        mesh,
+        in_shardings,
+        out_shardings,
+        static_argnums,
+        donate_argnums,
+    )
+
+  # extract in/out-sharding from compiled function
+  in_shardings = compiled.input_shardings[0]
+  out_shardings = compiled.output_shardings[0]
+
+  return compiled, in_shardings, out_shardings, static_argnums, donate_argnums
 
 def get_functional_train_with_signature(train_step, mesh, state_mesh_shardings, model, config):
   """Get the shardings (both state and data) for train_step"""

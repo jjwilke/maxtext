@@ -27,7 +27,8 @@ import functools
 import time
 import queue
 
-from typing import Sequence
+
+from typing import Optional, Sequence
 from absl import app
 from flax import linen as nn
 from flax.linen import partitioning as nn_partitioning
@@ -54,6 +55,7 @@ from vertex_tensorboard import VertexTensorboardManager
 # Placeholder: internal
 
 from input_pipeline.input_pipeline_interface import create_data_iterator
+from input_pipeline import input_pipeline_interface
 from layers import models
 
 from gcp_workload_monitor import GCPWorkloadMonitor
@@ -119,7 +121,6 @@ def record_scalar_metrics(metrics, step_time_delta, per_device_tflops, lr, per_d
   metrics["scalar"].update({"perf/per_device_tokens": per_device_tokens})
   metrics["scalar"].update({"perf/per_device_tokens_per_sec": per_device_tokens / step_time_delta.total_seconds()})
   metrics["scalar"].update({"learning/current_learning_rate": lr})
-
 
 def save_checkpoint(
     checkpoint_manager,
@@ -372,9 +373,12 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
   xent = nn.with_logical_constraint(xent, ("activation_embed_and_logits_batch", "activation_length"))
   # Mask out paddings at the end of each example.
   xent = xent * (data["targets_segmentation"] != 0)
-  total_loss = jnp.sum(xent)
-  total_weights = jnp.sum(data["targets_segmentation"] != 0)
-  loss = total_loss / (total_weights + EPS)
+  per_batch_xent = jnp.sum(xent, axis=-1)
+  per_batch_weights = jnp.sum(data["targets_segmentation"] != 0, axis=-1)
+  per_batch_loss = per_batch_xent / (per_batch_weights + EPS)
+  total_loss = jnp.sum(per_batch_xent)
+  total_weights = jnp.sum(per_batch_weights)
+  loss = jnp.sum(per_batch_loss)
   # get moe load balance loss
   moe_lb_loss = 0.0
   if config.num_experts > 1:
@@ -390,6 +394,20 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
   }
   return loss, aux
 
+
+class MicrobatchConfig:
+  size: Optional[int] = None
+  schedule: str = "wavefront"
+  num_stages: Optional[int] = None
+  interleave: int = 1
+
+microbatch_config = MicrobatchConfig()
+
+def set_mb_config(mb_size, schedule, num_stages, interleave):
+    microbatch_config.size = mb_size
+    microbatch_config.schedule = schedule
+    microbatch_config.num_stages = num_stages
+    microbatch_config.interleave = interleave
 
 def train_step(model, config, state_mesh_shardings, state, data, dropout_rng):
   """
@@ -456,6 +474,28 @@ def train_step(model, config, state_mesh_shardings, state, data, dropout_rng):
         extra_dpo_args = [reference_params]
     grad_func = jax.value_and_grad(_loss_fn, argnums=4, has_aux=True)
     (loss, aux), raw_grads = grad_func(model, config, data, dropout_rng, state.params, *extra_dpo_args, is_train=True)
+
+    if microbatch_config.size is None or microbatch_config.size == config.global_batch_size_to_train_on:
+      (loss, aux), raw_grads = grad_func(model, config, data, dropout_rng, state.params, **extra_dpo_args, is_train=True)
+    else:
+      from legate.jax import microbatch
+
+      def microbatch_input_sharding(x):
+        return None
+
+      arg_shardings = jax.tree_map(microbatch_input_sharding, data)
+
+      def mb_grad_func(data, dropout, params):
+        return grad_func(model, config, data, dropout, params, is_train=True)
+
+      mb_grad_func = microbatch(mb_grad_func, dim=0, argnum=0,
+                             size=microbatch_config.size, arg_shardings=arg_shardings,
+                             schedule=microbatch_config.schedule, num_stages=microbatch_config.num_stages,
+                             interleave=microbatch_config.interleave)
+
+      (loss, aux), raw_grads = mb_grad_func(data, dropout_rng, state.params)
+
+
   intermediate_outputs = aux["intermediate_outputs"]
   total_weights = aux["total_weights"]
   moe_lb_loss = aux["moe_lb_loss"]
@@ -475,15 +515,19 @@ def train_step(model, config, state_mesh_shardings, state, data, dropout_rng):
 
   scalar_metrics = {
       "learning/loss": loss,
-      "learning/moe_lb_loss": moe_lb_loss,
-      "learning/total_weights": total_weights,
+      #"learning/moe_lb_loss": moe_lb_loss,
+      #"learning/total_weights": total_weights,
   }
   if not config.optimizer_memory_host_offload:
-    scalar_metrics["learning/grad_norm"] = max_utils.l2norm_pytree(grads)
-    scalar_metrics["learning/raw_grad_norm"] = max_utils.l2norm_pytree(raw_grads)
-    scalar_metrics["learning/param_norm"] = max_utils.l2norm_pytree(new_state.params)
+    pass
+    #scalar_metrics["learning/grad_norm"] = max_utils.l2norm_pytree(grads)
+    #scalar_metrics["learning/raw_grad_norm"] = max_utils.l2norm_pytree(raw_grads)
+    #scalar_metrics["learning/param_norm"] = max_utils.l2norm_pytree(new_state.params)
+
   if config.use_dpo:
-    scalar_metrics["learning/dpo_reward_accuracy"] = aux["reward_accuracy"]
+    pass
+    #scalar_metrics["learning/dpo_reward_accuracy"] = aux["reward_accuracy"]
+
   metrics = {
       "scalar": scalar_metrics,
       "scalars": {},
@@ -652,9 +696,9 @@ def setup_train_loop(config):
       model, data_iterator, tx, config, init_rng, mesh, checkpoint_manager
   )
 
-  if not config.using_pipeline_parallelism:
-    # The vocab tensor(s) of shape [vocab, embed] (and transpose) are not sharded by stage
-    maxtext_utils.assert_params_sufficiently_sharded(state.params, mesh, config.sharding_tolerance)
+  #if not config.using_pipeline_parallelism:
+  #  # The vocab tensor(s) of shape [vocab, embed] (and transpose) are not sharded by stage
+  #  maxtext_utils.assert_params_sufficiently_sharded(state.params, mesh, config.sharding_tolerance)
 
   if config.use_dpo:
     abstract_state, _, _ = max_utils.get_abstract_state(model, tx, config, init_rng, mesh, is_training=True)
@@ -682,7 +726,21 @@ def setup_train_loop(config):
       )
 
   record_goodput(recorder, config, recorder.record_training_preparation_end_time if recorder else None)
+
+  # Shaped RNG keys
+  _, example_rng = jax.random.split(jax.random.PRNGKey(0), 2)
+  shaped_rng = jax.ShapeDtypeStruct(example_rng.shape, example_rng.dtype)
+
+  # un-sharded abstract state
+  init_state_partial, abstract_state, state_mesh_annotations = max_utils.get_abstract_state_no_sharding(model, tx, config, example_rng, mesh)
+
+  # Shaped batch
+  shaped_batch = input_pipeline_interface.get_shaped_batch(config)
+
+  shaped_train_args = (abstract_state, shaped_batch, shaped_rng)
+
   return (
+      init_state_partial,
       init_rng,
       writer,
       checkpoint_manager,
@@ -692,7 +750,7 @@ def setup_train_loop(config):
       learning_rate_schedule,
       data_iterator,
       eval_data_iterator,
-      state,
+      shaped_train_args,
   )
 
 
@@ -709,6 +767,7 @@ def train_loop(config, state=None):
   record_goodput(recorder, config, recorder.record_job_start_time if recorder else None)
 
   (
+      init_state_partial,
       init_rng,
       writer,
       checkpoint_manager,
@@ -718,7 +777,7 @@ def train_loop(config, state=None):
       learning_rate_schedule,
       data_iterator,
       eval_data_iterator,
-      state,
+      shaped_train_args,
   ) = setup_train_loop(config)
 
   if config.use_dpo:
@@ -734,7 +793,8 @@ def train_loop(config, state=None):
       out_shard_train,
       static_argnums_train,
       donate_argnums_train,
-  ) = maxtext_utils.get_functional_train_with_signature(train_step, mesh, state_mesh_shardings, model, config)
+  ) = maxtext_utils.get_and_compile_functional_train_with_signature(train_step, mesh, state_mesh_shardings, model, config, shaped_train_args)
+
 
   if eval_data_iterator:
     # pylint: disable=line-too-long
@@ -745,6 +805,9 @@ def train_loop(config, state=None):
         static_argnums_eval,
         donate_argnums_eval,
     ) = maxtext_utils.get_functional_eval_with_signature(eval_step, mesh, state_mesh_shardings, model, config)
+
+  # postponed initial state fetch as we needed to evaluate sharding first
+  state = max_utils.initialize_state_with_sharding(init_state_partial, mesh, in_shard_train[0], in_shard_train[2], init_rng)
 
   num_model_parameters = max_utils.calculate_num_params_from_pytree(state.params)
   max_logging.log(f"number parameters: {num_model_parameters/1e9:.3f} billion")
@@ -765,15 +828,9 @@ def train_loop(config, state=None):
     p_eval_step = None
     print("Loaded compiled function!", flush=True)
   else:
-    p_train_step = jax.jit(
-        functional_train,
-        in_shardings=in_shard_train,
-        out_shardings=out_shard_train,
-        static_argnums=static_argnums_train,
-        donate_argnums=donate_argnums_train,
-    )
+    p_train_step=functional_train
 
-    if eval_data_iterator:
+    if config.eval_interval > 0 and eval_data_iterator:
       p_eval_step = jax.jit(
           functional_eval,
           in_shardings=in_shard_eval,
@@ -906,7 +963,11 @@ def train_loop(config, state=None):
   record_goodput(recorder, config, recorder.record_job_end_time if recorder else None)
   with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
     # pytype: disable=attribute-error
-    compiled = p_train_step.lower(state, example_batch, nextrng).compile()
+    if hasattr(p_train_step, "lower"):
+      compiled = p_train_step.lower(state, example_batch, nextrng).compile()
+    else:
+      compiled = p_train_step
+
     compiled_stats = compiled.memory_analysis()
     if compiled_stats is not None:
       max_logging.log(

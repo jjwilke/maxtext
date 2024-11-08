@@ -119,7 +119,7 @@ class MetricLogger:
             f"completed step: {step}, seconds: {metrics['scalar']['perf/step_time_seconds']:.3f}, "
             f"TFLOP/s/device: {metrics['scalar']['perf/per_device_tflops_per_sec']:.3f}, "
             f"Tokens/s/device: {metrics['scalar']['perf/per_device_tokens_per_sec']:.3f}, "
-            f"total_weights: {metrics['scalar']['learning/total_weights']}, "
+#            f"total_weights: {metrics['scalar']['learning/total_weights']}, "
             f"loss: {metrics['scalar']['learning/loss']:.3f}"
         )
 

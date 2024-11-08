@@ -189,7 +189,7 @@ class Decoder(nn.Module):
     """Initialize decoder layer."""
     self.decoder_layer = self.get_decoder_layers()
     self.norm_layer = self.get_norm_layer()
-    if self.config.using_pipeline_parallelism:
+    if False and self.config.using_pipeline_parallelism:
       pipeline_stage_module = self.get_pipeline_stage_module(self.decoder_layer[0])
       remat_policy = self.get_remat_policy()
       self.pipeline_module = pipeline.Pipeline(
@@ -412,7 +412,7 @@ class Decoder(nn.Module):
     policy = self.get_remat_policy()
     RemattedBlockLayers = self.set_remat_policy(self.decoder_layer, policy)
 
-    if cfg.using_pipeline_parallelism:
+    if False and cfg.using_pipeline_parallelism:
       if cfg.pipeline_fsdp_ag_once:
         partition_spec = self.pipeline_module.get_weight_sharding(
             y, decoder_segment_ids, decoder_positions, deterministic, model_mode
