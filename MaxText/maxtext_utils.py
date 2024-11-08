@@ -19,9 +19,12 @@ limitations under the License.
 
 import jax
 import optax
+import optimizers
 import max_utils
 from jax.sharding import PartitionSpec as P
 from jax.experimental.serialize_executable import deserialize_and_load
+from flax.linen import partitioning as nn_partitioning
+from jax.experimental.pjit import pjit, AUTO
 
 
 import pickle
@@ -30,6 +33,148 @@ from input_pipeline import input_pipeline_interface
 
 OVERWRITE_WITH_GRADIENT = "_overwrite_with_gradient"
 
+def bind_mesh(pjitted_fn, global_mesh: jax.sharding.Mesh):
+  """Wraps a pjitted_fn with a mesh context."""
+
+  def call(*args):
+    with global_mesh:
+      return pjitted_fn(*args)
+
+  def lower(*args, **kwargs):
+    with global_mesh:
+      return pjitted_fn.lower(*args, **kwargs)
+
+  call.lower = lower
+  return call
+
+
+
+def jit_and_compile(
+    func,
+    func_input_args,
+    func_input_kwargs,
+    mesh,
+    in_shardings,
+    out_shardings,
+    static_argnums,
+    donate_argnums,
+):
+  """Jit, lower, and compile func."""
+  print(f"MFR: in_shardings = {in_shardings}")
+  print(f"MFR: out_shardings = {out_shardings}")
+  print(f"MFR: static_argnums = {static_argnums}")
+  print(f"MFR: donate_argnums = {donate_argnums}")
+  jitted = pjit(
+      func,
+      in_shardings=in_shardings,
+      out_shardings=out_shardings,
+      static_argnums=static_argnums,
+      donate_argnums=donate_argnums,
+  )
+
+  #def _create_aval(x):
+  #  # canonicalize_dtype is necessary to avoid errors like
+  #  # data types are different when compiling and when being called.
+  #  dtype = jax.dtypes.canonicalize_dtype(x.dtype)
+  #  return jax.core.ShapedArray(x.shape, dtype)
+  #
+  #func_input_args = jax.tree.map(_create_aval, func_input_args)
+
+  jitted = bind_mesh(jitted, mesh)
+
+  print(f"MFR: func_input_args[0] = {func_input_args[0]}")
+  print(f"MFR: func_input_args[1] = {func_input_args[1]}")
+
+  lowered = jitted.lower(*func_input_args, **func_input_kwargs)
+  compiled = lowered.compile()
+
+  print(f"MFR: compiled.input_shardings[0] {compiled.input_shardings[0]}")
+  print(f"MFR: compiled.output_shardings[0] {compiled.output_shardings[0]}")
+
+  sharding_str_arr = []
+  def check(inp, inp_sharding, out):
+    sharding_str_arr.append(f"{inp.shape} {inp.sharding} {out}")
+    if not inp_sharding.is_equivalent_to(out, len(inp.shape)):
+      raise Exception("\n".join(sharding_str_arr) + " mismatch")
+
+  jax.tree_map(check, func_input_args[0], compiled.input_shardings[0][0], compiled.output_shardings[0])
+
+  return compiled
+
+def get_and_compile_functional_train_with_signature(train_step, mesh, state_mesh_annotations, model, config, shaped_train_args):
+  """Get the shardings (both state and data) for train_step"""
+  functional_train = get_functional_train_step(train_step, model, config)
+  functional_train.__name__ = "train_step"
+  data_pspec = P(*config.data_sharding)
+
+  #state_mesh_shardings = jax.tree_util.tree_map(lambda p: jax.sharding.NamedSharding(mesh, p), state_mesh_annotations)
+  #data_sharding = jax.tree_util.tree_map(lambda p: jax.sharding.NamedSharding(mesh, p), data_pspec)
+  #in_shardings = (state_mesh_shardings, data_sharding, None)  # State, batch, rng
+  #out_shardings = (state_mesh_shardings, None)  # State, metrics
+  #print(f"MFR: state_mesh_shardings = {jax.tree_util.tree_map(lambda p: jax.sharding.NamedSharding(mesh, p), state_mesh_annotations)}")
+  #print(f"MFR: data_sharding = {jax.tree_util.tree_map(lambda p: jax.sharding.NamedSharding(mesh, p), data_pspec)}")
+
+
+  # combine specs with AUTO
+  fn_in_partition_specs = (
+        AUTO(mesh), #state(AUTO)
+        data_pspec, #batch
+        None, #rng
+    )
+
+  fn_out_partition_specs = (
+        AUTO(mesh), #state(AUTO)
+        None #metrics
+    )
+
+  print(f"MFR: fn_in_partition_specs = {fn_in_partition_specs}")
+  print(f"MFR: fn_out_partition_specs = {fn_out_partition_specs}")
+
+
+  def canonicalize_sharding(p):
+    if isinstance(p, jax.experimental.pjit.AUTO) or isinstance(p, jax.sharding.NamedSharding) or isinstance(p, jax.sharding.GSPMDSharding):
+      return p
+    return jax.sharding.NamedSharding(mesh, p)
+
+  fn_in_shardings = jax.tree_util.tree_map(canonicalize_sharding, fn_in_partition_specs)
+  fn_out_shardings = jax.tree_util.tree_map(canonicalize_sharding, fn_out_partition_specs)
+
+  print(f"MFR: fn_in_shardings = {fn_in_shardings}")
+  print(f"MFR: fn_out_shardings = {fn_out_shardings}")
+
+   # get shapes from config
+  #shaped_train_args, shaped_train_kwargs = get_shaped_inputs(mesh, model, config)
+  shaped_train_kwargs = {}
+
+  static_argnums = ()  # We partial out the static argnums of model and config
+  donate_argnums = 0  # This is the index of the state - we allow the compiler to make use of this memory.
+
+  from jax.lax import with_sharding_constraint
+  from legate.jax import autoshard
+  print(f"MFR: state_mesh_annotations = {state_mesh_annotations}")
+  def autoshard_train_fn(train_state, *args):
+    sharded_train_state = jax.tree_map(lambda x, y: with_sharding_constraint(x, y), train_state, state_mesh_annotations)
+    return functional_train(sharded_train_state, *args)
+
+
+  with mesh, autoshard(True), nn_partitioning.axis_rules(config.logical_axis_rules):
+    compiled = jit_and_compile(
+        autoshard_train_fn,
+        shaped_train_args,
+        shaped_train_kwargs,
+        mesh,
+        fn_in_shardings,
+        fn_out_shardings,
+        static_argnums,
+        donate_argnums,
+    )
+  print("Jitting and compilation complete!", flush=True)
+
+  # extract in/out-sharding from compiled function
+  in_shardings = compiled.input_shardings[0]
+  out_shardings = compiled.output_shardings[0]
+
+  return compiled, in_shardings, out_shardings, static_argnums, donate_argnums
 
 def get_functional_train_with_signature(train_step, mesh, state_mesh_annotations, model, config):
   """Get the shardings (both state and data) for train_step"""

@@ -26,7 +26,11 @@ import sys
 import functools
 import time
 
+<<<<<<< HEAD
 from typing import Sequence, Optional
+=======
+from typing import Optional, Sequence
+>>>>>>> 6b42eab4... single train.py, clean up run.py
 from absl import app
 from flax import linen as nn
 from flax.linen import partitioning as nn_partitioning
@@ -47,6 +51,7 @@ from vertex_tensorboard import VertexTensorboardManager
 # Placeholder: internal
 
 from input_pipeline.input_pipeline_interface import create_data_iterator
+from input_pipeline import input_pipeline_interface
 from layers import models
 
 import jax.numpy as jnp
@@ -63,6 +68,7 @@ from layers import quantizations
 
 from ml_goodput_measurement import goodput
 from ml_goodput_measurement import monitoring
+from praxis import trees
 
 # pylint: disable=too-many-positional-arguments
 
@@ -172,10 +178,10 @@ def write_metrics_to_tensorboard(writer, metrics, step, config, is_training=True
           f"loss: {metrics['scalar']['learning/loss']:.3f}"
       )
 
-      if full_log and jax.process_index() == 0:
-        max_logging.log(f"To see full metrics 'tensorboard --logdir={config.tensorboard_dir}'")
-        writer.flush()
 
+    if full_log and jax.process_index() == 0:
+      max_logging.log(f"To see full metrics 'tensorboard --logdir={config.tensorboard_dir}'")
+      writer.flush()
 
 def clear_buffered_metrics():
   global _buffered_step
@@ -318,6 +324,22 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
   return loss, aux
 
 
+
+# handling automatic microbatches via legate
+class MicrobatchConfig:
+  size: Optional[int] = None
+  schedule: str = "wavefront"
+  num_stages: Optional[int] = None
+  interleave: int = 1
+
+microbatch_config = MicrobatchConfig()
+
+def set_mb_config(mb_size, scheduler, num_stages, interleave):
+    microbatch_config.size = mb_size
+    microbatch_config.scheduler = scheduler
+    microbatch_config.num_stages = num_stages
+    microbatch_config.interleave = interleave
+
 def train_step(model, config, state, data, dropout_rng):
   """
 
@@ -367,7 +389,28 @@ def train_step(model, config, state, data, dropout_rng):
     aux = jax.tree_map(lambda x: jnp.sum(x, axis=0), aux)
   else:
     grad_func = jax.value_and_grad(loss_fn, argnums=4, has_aux=True)
-    (loss, aux), raw_grads = grad_func(model, config, data, dropout_rng, state.params, is_train=True)
+
+    ## logging
+    if microbatch_config.size is None or microbatch_config.size == config.global_batch_size_to_train_on:
+      (loss, aux), raw_grads = grad_func(model, config, data, dropout_rng, state.params, is_train=True)
+    else:
+      from legate.jax import microbatch
+
+      def microbatch_input_sharding(x):
+        return None
+
+      arg_shardings = jax.tree_map(microbatch_input_sharding, data)
+
+      def mb_grad_func(data, dropout, params):
+        return grad_func(model, config, data, dropout, params, is_train=True)
+
+      mb_grad_func = microbatch(mb_grad_func, dim=0, argnum=0,
+                             size=microbatch_config.size, arg_shardings=arg_shardings,
+                             schedule=microbatch_config.schedule, num_stages=microbatch_config.num_stages,
+                             interleave=microbatch_config.interleave)
+
+      (loss, aux), raw_grads = mb_grad_func(data, dropout_rng, state.params)
+
   intermediate_outputs = aux["intermediate_outputs"]
   total_weights = aux["total_weights"]
   moe_lb_loss = aux["moe_lb_loss"]
@@ -530,15 +573,29 @@ def setup_train_loop(config):
   record_goodput(recorder, config, recorder.record_training_preparation_start_time if recorder else None)
   data_iterator, eval_data_iterator = create_data_iterator(config, mesh)
 
-  state, state_mesh_annotations, data_iterator = max_utils.setup_training_state(
-      model, data_iterator, tx, config, init_rng, mesh, checkpoint_manager
-  )
+  #state, state_mesh_annotations, data_iterator = max_utils.setup_training_state(
+  #    model, data_iterator, tx, config, init_rng, mesh, checkpoint_manager
+  #)
 
   if not config.using_pipeline_parallelism:
     # The vocab tensor(s) of shape [vocab, embed] (and transpose) are not sharded by stage
     maxtext_utils.assert_params_sufficiently_sharded(state.params, mesh, tolerance=0.02)
   record_goodput(recorder, config, recorder.record_training_preparation_end_time if recorder else None)
+
+  # Shaped RNG keys
+  _, example_rng = jax.random.split(jax.random.PRNGKey(0), 2)
+  shaped_rng = jax.ShapeDtypeStruct(example_rng.shape, example_rng.dtype)
+
+  # un-sharded abstract state
+  init_state_partial, abstract_state, state_mesh_annotations = max_utils.get_abstract_state_no_sharding(model, tx, config, example_rng, mesh)
+
+  # Shaped batch
+  shaped_batch = input_pipeline_interface.get_shaped_batch(config)
+
+  shaped_train_args = (abstract_state, shaped_batch, shaped_rng)
+
   return (
+      init_state_partial,
       init_rng,
       writer,
       checkpoint_manager,
@@ -548,7 +605,7 @@ def setup_train_loop(config):
       learning_rate_schedule,
       data_iterator,
       eval_data_iterator,
-      state,
+      shaped_train_args,
   )
 
 
@@ -565,6 +622,7 @@ def train_loop(config, state=None):
   record_goodput(recorder, config, recorder.record_job_start_time if recorder else None)
 
   (
+      init_state_partial,
       init_rng,
       writer,
       checkpoint_manager,
@@ -574,8 +632,9 @@ def train_loop(config, state=None):
       learning_rate_schedule,
       data_iterator,
       eval_data_iterator,
-      state,
+      shaped_train_args,
   ) = setup_train_loop(config)
+
   # pylint: disable=line-too-long
   (
       functional_train,
@@ -583,7 +642,7 @@ def train_loop(config, state=None):
       out_shard_train,
       static_argnums_train,
       donate_argnums_train,
-  ) = maxtext_utils.get_functional_train_with_signature(train_step, mesh, state_mesh_annotations, model, config)
+  ) = maxtext_utils.get_and_compile_functional_train_with_signature(train_step, mesh, state_mesh_annotations, model, config, shaped_train_args)
 
   if eval_data_iterator:
     # pylint: disable=line-too-long
@@ -594,6 +653,9 @@ def train_loop(config, state=None):
         static_argnums_eval,
         donate_argnums_eval,
     ) = maxtext_utils.get_functional_eval_with_signature(eval_step, mesh, state_mesh_annotations, model, config)
+
+  # postponed initial state fetch as we needed to evaluate sharding first
+  state = max_utils.initialize_state_with_sharding(init_state_partial, mesh, in_shard_train[0], in_shard_train[2], init_rng)
 
   num_model_parameters = max_utils.calculate_num_params_from_pytree(state.params)
   max_logging.log(f"number parameters: {num_model_parameters/1e9:.3f} billion")
@@ -614,15 +676,9 @@ def train_loop(config, state=None):
     p_eval_step = None
     print("Loaded compiled function!", flush=True)
   else:
-    p_train_step = jax.jit(
-        functional_train,
-        in_shardings=in_shard_train,
-        out_shardings=out_shard_train,
-        static_argnums=static_argnums_train,
-        donate_argnums=donate_argnums_train,
-    )
+    p_train_step=functional_train
 
-    if eval_data_iterator:
+    if config.eval_interval > 0 and eval_data_iterator:
       p_eval_step = jax.jit(
           functional_eval,
           in_shardings=in_shard_eval,
@@ -675,7 +731,8 @@ def train_loop(config, state=None):
         checkpoint_manager.wait_until_finished()
         sys.exit()
 
-    write_metrics(writer, local_metrics_file, running_gcs_metrics, metrics, step, config)
+    if writer:
+      write_metrics(writer, local_metrics_file, running_gcs_metrics, metrics, step, config)
 
     if config.eval_interval > 0 and step > start_step and (step + 1) % config.eval_interval == 0:
       assert eval_data_iterator
@@ -721,7 +778,8 @@ def train_loop(config, state=None):
 
   if checkpoint_manager is not None:
     checkpoint_manager.wait_until_finished()
-  write_metrics(writer, local_metrics_file, running_gcs_metrics, metrics, config.steps - 1, config)  # final step metrics
+  if writer:
+    write_metrics(writer, local_metrics_file, running_gcs_metrics, metrics, config.steps - 1, config)  # final step metrics
   max_utils.close_summary_writer(writer)
   record_goodput(recorder, config, recorder.record_job_end_time if recorder else None)
   clear_buffered_metrics()
@@ -736,6 +794,7 @@ def main(argv: Sequence[str]) -> None:
   pyconfig.initialize(argv)
   max_utils.print_system_information()
   config = pyconfig.config
+
   validate_train_config(config)
   os.environ["TFDS_DATA_DIR"] = config.dataset_path
   vertex_tensorboard_manager = VertexTensorboardManager()

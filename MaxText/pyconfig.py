@@ -167,6 +167,14 @@ def validate_model_name(s: str) -> bool:
   if s not in valid_model_names:
     raise ValueError("Invalid model name was passed. Valid options ", valid_model_names)
 
+def validate_overrides_consistent(keys1: list[str], keys2: list[str], raw_keys: dict, raw_keys_old: dict):
+  overwritten_keys = [k for k in keys1 if k in keys2]
+  for key in overwritten_keys:
+      if raw_keys_old[key] != raw_keys[key]:
+          raise ValueError(
+              f"Key {key} inconsistently overwritten by argument({raw_keys_old[key]})"
+              f" and model({raw_keys[key]}). This isn't allowed."
+          )
 
 def validate_no_keys_overwritten_twice(keys1: list[str], keys2: list[str]):
   overwritten_keys = [k for k in keys1 if k in keys2]
@@ -276,9 +284,12 @@ class _HyperParameters:
     raw_keys = OrderedDict()
     keys_from_env_and_command_line = self._update_from_env_and_command_line(raw_keys, raw_data_from_yaml, argv, **kwargs)
     max_logging.log(f"Updating keys from env and command line: {keys_from_env_and_command_line}")
+    raw_keys_before_model = raw_keys.copy()
     keys_from_model = _HyperParameters.update_model_vars(argv[1], raw_keys, config_name)
     max_logging.log(f"Updating keys from model: {keys_from_model}")
-    validate_no_keys_overwritten_twice(keys_from_env_and_command_line, keys_from_model)
+
+    validate_overrides_consistent(keys_from_env_and_command_line, keys_from_model, raw_keys, raw_keys_before_model)
+    #validate_no_keys_overwritten_twice(keys_from_env_and_command_line, keys_from_model)
 
     # We initialize the jax distributed system here because it must be done before device backend is initialized.
     max_utils.maybe_initialize_jax_distributed_system(raw_keys)
