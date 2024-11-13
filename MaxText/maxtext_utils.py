@@ -26,6 +26,11 @@ from jax.experimental.serialize_executable import deserialize_and_load
 from flax.linen import partitioning as nn_partitioning
 from jax.experimental.pjit import pjit, AUTO
 
+try:
+  from legate.jax import MeshWrapper
+except ImportError:
+  pass
+
 
 import pickle
 import functools
@@ -60,10 +65,6 @@ def jit_and_compile(
     donate_argnums,
 ):
   """Jit, lower, and compile func."""
-  print(f"MFR: in_shardings = {in_shardings}")
-  print(f"MFR: out_shardings = {out_shardings}")
-  print(f"MFR: static_argnums = {static_argnums}")
-  print(f"MFR: donate_argnums = {donate_argnums}")
   jitted = pjit(
       func,
       in_shardings=in_shardings,
@@ -82,14 +83,10 @@ def jit_and_compile(
 
   jitted = bind_mesh(jitted, mesh)
 
-  print(f"MFR: func_input_args[0] = {func_input_args[0]}")
-  print(f"MFR: func_input_args[1] = {func_input_args[1]}")
-
-  lowered = jitted.lower(*func_input_args, **func_input_kwargs)
-  compiled = lowered.compile()
-
-  print(f"MFR: compiled.input_shardings[0] {compiled.input_shardings[0]}")
-  print(f"MFR: compiled.output_shardings[0] {compiled.output_shardings[0]}")
+  with MeshWrapper.lower_mode():
+    lowered = jitted.lower(*func_input_args, **func_input_kwargs)
+  with MeshWrapper.compile_mode():
+    compiled = lowered.compile()
 
   sharding_str_arr = []
   def check(inp, inp_sharding, out):
@@ -102,18 +99,23 @@ def jit_and_compile(
   return compiled
 
 def get_and_compile_functional_train_with_signature(train_step, mesh, state_mesh_annotations, model, config, shaped_train_args):
+
+  transformer_shape = [
+      config.ici_data_parallelism,
+      config.ici_pipeline_parallelism,
+      config.ici_fsdp_parallelism,
+      config.ici_fsdp_transpose_parallelism,
+      config.ici_sequence_parallelism,
+      config.ici_tensor_parallelism,
+      config.ici_expert_parallelism,
+      config.ici_autoregressive_parallelism,
+  ]
+  mesh = MeshWrapper(mesh, transformer_shape)
+
   """Get the shardings (both state and data) for train_step"""
   functional_train = get_functional_train_step(train_step, model, config)
   functional_train.__name__ = "train_step"
   data_pspec = P(*config.data_sharding)
-
-  #state_mesh_shardings = jax.tree_util.tree_map(lambda p: jax.sharding.NamedSharding(mesh, p), state_mesh_annotations)
-  #data_sharding = jax.tree_util.tree_map(lambda p: jax.sharding.NamedSharding(mesh, p), data_pspec)
-  #in_shardings = (state_mesh_shardings, data_sharding, None)  # State, batch, rng
-  #out_shardings = (state_mesh_shardings, None)  # State, metrics
-  #print(f"MFR: state_mesh_shardings = {jax.tree_util.tree_map(lambda p: jax.sharding.NamedSharding(mesh, p), state_mesh_annotations)}")
-  #print(f"MFR: data_sharding = {jax.tree_util.tree_map(lambda p: jax.sharding.NamedSharding(mesh, p), data_pspec)}")
-
 
   # combine specs with AUTO
   fn_in_partition_specs = (
@@ -127,10 +129,6 @@ def get_and_compile_functional_train_with_signature(train_step, mesh, state_mesh
         None #metrics
     )
 
-  print(f"MFR: fn_in_partition_specs = {fn_in_partition_specs}")
-  print(f"MFR: fn_out_partition_specs = {fn_out_partition_specs}")
-
-
   def canonicalize_sharding(p):
     if isinstance(p, jax.experimental.pjit.AUTO) or isinstance(p, jax.sharding.NamedSharding) or isinstance(p, jax.sharding.GSPMDSharding):
       return p
@@ -138,9 +136,6 @@ def get_and_compile_functional_train_with_signature(train_step, mesh, state_mesh
 
   fn_in_shardings = jax.tree_util.tree_map(canonicalize_sharding, fn_in_partition_specs)
   fn_out_shardings = jax.tree_util.tree_map(canonicalize_sharding, fn_out_partition_specs)
-
-  print(f"MFR: fn_in_shardings = {fn_in_shardings}")
-  print(f"MFR: fn_out_shardings = {fn_out_shardings}")
 
    # get shapes from config
   #shaped_train_args, shaped_train_kwargs = get_shaped_inputs(mesh, model, config)
@@ -151,7 +146,6 @@ def get_and_compile_functional_train_with_signature(train_step, mesh, state_mesh
 
   from jax.lax import with_sharding_constraint
   from legate.jax import autoshard
-  print(f"MFR: state_mesh_annotations = {state_mesh_annotations}")
   def autoshard_train_fn(train_state, *args):
     sharded_train_state = jax.tree_map(lambda x, y: with_sharding_constraint(x, y), train_state, state_mesh_annotations)
     return functional_train(sharded_train_state, *args)
@@ -168,7 +162,6 @@ def get_and_compile_functional_train_with_signature(train_step, mesh, state_mesh
         static_argnums,
         donate_argnums,
     )
-  print("Jitting and compilation complete!", flush=True)
 
   # extract in/out-sharding from compiled function
   in_shardings = compiled.input_shardings[0]
