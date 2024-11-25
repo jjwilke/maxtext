@@ -102,7 +102,7 @@ def get_and_compile_functional_train_with_signature(train_step, mesh, state_mesh
 
   transformer_shape = [
       config.ici_data_parallelism,
-      config.ici_pipeline_parallelism,
+      1, # config.ici_pipeline_parallelism,
       config.ici_fsdp_parallelism,
       config.ici_fsdp_transpose_parallelism,
       config.ici_sequence_parallelism,

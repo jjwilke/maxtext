@@ -302,7 +302,7 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
   # Mask out paddings at the end of each example.
   xent = xent * (data["targets_segmentation"] != 0)
   total_loss = jnp.sum(xent)
-  total_weights = jnp.sum(data["targets_segmentation"] != 0)
+  total_weights = 1.0 #jnp.sum(data["targets_segmentation"] != 0)
   loss = total_loss / (total_weights + EPS)
   # get moe load balance loss
   moe_lb_loss = 0.0
@@ -416,17 +416,17 @@ def train_step(model, config, state, data, dropout_rng):
   else:
     grads = raw_grads
   new_state = state.apply_gradients(grads=grads)
-  metrics = {
-      "scalar": {
-          "learning/loss": loss,
-          "learning/moe_lb_loss": moe_lb_loss,
-          "learning/total_weights": total_weights,
-          "learning/grad_norm": max_utils.l2norm_pytree(grads),
-          "learning/raw_grad_norm": max_utils.l2norm_pytree(raw_grads),
-          "learning/param_norm": max_utils.l2norm_pytree(new_state.params),
-      },
-      "scalars": {},
-  }
+  metrics = {}
+  #    "scalar": {
+  #        "learning/loss": loss,
+  #        "learning/moe_lb_loss": moe_lb_loss,
+  #        "learning/total_weights": total_weights,
+  #        "learning/grad_norm": max_utils.l2norm_pytree(grads),
+  #        "learning/raw_grad_norm": max_utils.l2norm_pytree(raw_grads),
+  #        "learning/param_norm": max_utils.l2norm_pytree(new_state.params),
+  #    },
+  #    "scalars": {},
+  #}
 
   if config.record_internal_nn_metrics:
     record_activation_metrics(metrics, intermediate_outputs, config)
@@ -713,9 +713,9 @@ def train_loop(config, state=None):
         state, metrics = p_train_step(state, example_batch, nextrng)
 
     new_time = datetime.datetime.now()
-    record_scalar_metrics(
-        metrics, new_time - last_step_completion, per_device_tflops, learning_rate_schedule(step), per_device_tokens
-    )
+    #record_scalar_metrics(
+    #    metrics, new_time - last_step_completion, per_device_tflops, learning_rate_schedule(step), per_device_tokens
+    #)
     last_step_completion = new_time
 
     if checkpoint_manager is not None:
