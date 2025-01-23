@@ -91,7 +91,7 @@ def validate_train_config(config):
 
 def get_first_step(state):
   with jax.spmd_mode("allow_all"):
-    return 0 #int(state.step)
+    return int(state.step)
 
 
 def load_next_batch(train_iter, example_batch, config):
@@ -300,10 +300,14 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
   xent, _ = max_utils.cross_entropy_with_logits(logits, one_hot_targets, 0.0)
   xent = nn.with_logical_constraint(xent, ("activation_embed_and_logits_batch", "activation_length"))
   # Mask out paddings at the end of each example.
+  #with jax.named_scope("wtaf"):
   xent = xent * (data["targets_segmentation"] != 0)
-  total_loss = jnp.sum(xent)
-  total_weights = 1.0 #jnp.sum(data["targets_segmentation"] != 0)
-  loss = total_loss / (total_weights + EPS)
+  per_batch_xent = jnp.sum(xent, axis=-1)
+  per_batch_weights = jnp.sum(data["targets_segmentation"] != 0, axis=-1)
+  per_batch_loss = per_batch_xent / (per_batch_weights + EPS)
+  total_loss = jnp.sum(per_batch_xent)
+  total_weights = jnp.sum(per_batch_weights)
+  loss = jnp.sum(per_batch_loss)
   # get moe load balance loss
   moe_lb_loss = 0.0
   if config.num_experts > 1:
@@ -330,9 +334,9 @@ class MicrobatchConfig:
 
 microbatch_config = MicrobatchConfig()
 
-def set_mb_config(mb_size, scheduler, num_stages, interleave):
+def set_mb_config(mb_size, schedule, num_stages, interleave):
     microbatch_config.size = mb_size
-    microbatch_config.scheduler = scheduler
+    microbatch_config.schedule = schedule
     microbatch_config.num_stages = num_stages
     microbatch_config.interleave = interleave
 
@@ -416,17 +420,17 @@ def train_step(model, config, state, data, dropout_rng):
   else:
     grads = raw_grads
   new_state = state.apply_gradients(grads=grads)
-  metrics = {}
-  #    "scalar": {
-  #        "learning/loss": loss,
-  #        "learning/moe_lb_loss": moe_lb_loss,
-  #        "learning/total_weights": total_weights,
-  #        "learning/grad_norm": max_utils.l2norm_pytree(grads),
-  #        "learning/raw_grad_norm": max_utils.l2norm_pytree(raw_grads),
-  #        "learning/param_norm": max_utils.l2norm_pytree(new_state.params),
-  #    },
-  #    "scalars": {},
-  #}
+  metrics = {
+      "scalar": {
+          "learning/loss": loss,
+          #"learning/moe_lb_loss": moe_lb_loss,
+          #"learning/total_weights": total_weights,
+          #"learning/grad_norm": max_utils.l2norm_pytree(grads),
+          #"learning/raw_grad_norm": max_utils.l2norm_pytree(raw_grads),
+          #"learning/param_norm": max_utils.l2norm_pytree(new_state.params),
+      },
+      "scalars": {},
+  }
 
   if config.record_internal_nn_metrics:
     record_activation_metrics(metrics, intermediate_outputs, config)

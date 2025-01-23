@@ -99,17 +99,7 @@ def jit_and_compile(
   return compiled
 
 def get_and_compile_functional_train_with_signature(train_step, mesh, state_mesh_annotations, model, config, shaped_train_args):
-
-  transformer_shape = [
-      config.ici_data_parallelism,
-      1, # config.ici_pipeline_parallelism,
-      config.ici_fsdp_parallelism,
-      config.ici_fsdp_transpose_parallelism,
-      config.ici_sequence_parallelism,
-      config.ici_tensor_parallelism,
-      config.ici_expert_parallelism,
-      config.ici_autoregressive_parallelism,
-  ]
+  transformer_shape = [(size if (name != 'stage') else 1) for name, size in mesh.shape.items()]
   mesh = MeshWrapper(mesh, transformer_shape)
 
   """Get the shardings (both state and data) for train_step"""
@@ -117,25 +107,16 @@ def get_and_compile_functional_train_with_signature(train_step, mesh, state_mesh
   functional_train.__name__ = "train_step"
   data_pspec = P(*config.data_sharding)
 
-  # combine specs with AUTO
-  fn_in_partition_specs = (
-        AUTO(mesh), #state(AUTO)
-        data_pspec, #batch
-        None, #rng
-    )
-
-  fn_out_partition_specs = (
-        AUTO(mesh), #state(AUTO)
-        None #metrics
-    )
-
   def canonicalize_sharding(p):
-    if isinstance(p, jax.experimental.pjit.AUTO) or isinstance(p, jax.sharding.NamedSharding) or isinstance(p, jax.sharding.GSPMDSharding):
+    if isinstance(p, jax.sharding.NamedSharding) or isinstance(p, jax.sharding.GSPMDSharding):
       return p
-    return jax.sharding.NamedSharding(mesh, p)
+    return AUTO(mesh)
 
-  fn_in_shardings = jax.tree_util.tree_map(canonicalize_sharding, fn_in_partition_specs)
-  fn_out_shardings = jax.tree_util.tree_map(canonicalize_sharding, fn_out_partition_specs)
+  state_mesh_shardings = jax.tree_util.tree_map(canonicalize_sharding, state_mesh_annotations)
+  data_sharding = jax.tree_util.tree_map(lambda p: jax.sharding.NamedSharding(mesh, p), data_pspec)
+  in_shardings = (state_mesh_shardings, data_sharding, None)  # State, batch, rng
+
+  out_shardings = (state_mesh_shardings, None)
 
    # get shapes from config
   #shaped_train_args, shaped_train_kwargs = get_shaped_inputs(mesh, model, config)
@@ -150,15 +131,14 @@ def get_and_compile_functional_train_with_signature(train_step, mesh, state_mesh
     sharded_train_state = jax.tree_map(lambda x, y: with_sharding_constraint(x, y), train_state, state_mesh_annotations)
     return functional_train(sharded_train_state, *args)
 
-
   with mesh, autoshard(True), nn_partitioning.axis_rules(config.logical_axis_rules):
     compiled = jit_and_compile(
         autoshard_train_fn,
         shaped_train_args,
         shaped_train_kwargs,
         mesh,
-        fn_in_shardings,
-        fn_out_shardings,
+        in_shardings,
+        out_shardings,
         static_argnums,
         donate_argnums,
     )
