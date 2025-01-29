@@ -73,14 +73,6 @@ def jit_and_compile(
       donate_argnums=donate_argnums,
   )
 
-  #def _create_aval(x):
-  #  # canonicalize_dtype is necessary to avoid errors like
-  #  # data types are different when compiling and when being called.
-  #  dtype = jax.dtypes.canonicalize_dtype(x.dtype)
-  #  return jax.core.ShapedArray(x.shape, dtype)
-  #
-  #func_input_args = jax.tree.map(_create_aval, func_input_args)
-
   jitted = bind_mesh(jitted, mesh)
 
   with MeshWrapper.lower_mode():

@@ -170,7 +170,7 @@ def write_metrics_to_tensorboard(writer, metrics, step, config, is_training=True
           f"completed step: {step}, seconds: {metrics['scalar']['perf/step_time_seconds']:.3f}, "
           f"TFLOP/s/device: {metrics['scalar']['perf/per_device_tflops_per_sec']:.3f}, "
           f"Tokens/s/device: {metrics['scalar']['perf/per_device_tokens_per_sec']:.3f}, "
-          f"total_weights: {metrics['scalar']['learning/total_weights']}, "
+          #f"total_weights: {metrics['scalar']['learning/total_weights']}, "
           f"loss: {metrics['scalar']['learning/loss']:.3f}"
       )
 
@@ -300,7 +300,6 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
   xent, _ = max_utils.cross_entropy_with_logits(logits, one_hot_targets, 0.0)
   xent = nn.with_logical_constraint(xent, ("activation_embed_and_logits_batch", "activation_length"))
   # Mask out paddings at the end of each example.
-  #with jax.named_scope("wtaf"):
   xent = xent * (data["targets_segmentation"] != 0)
   per_batch_xent = jnp.sum(xent, axis=-1)
   per_batch_weights = jnp.sum(data["targets_segmentation"] != 0, axis=-1)
@@ -717,9 +716,9 @@ def train_loop(config, state=None):
         state, metrics = p_train_step(state, example_batch, nextrng)
 
     new_time = datetime.datetime.now()
-    #record_scalar_metrics(
-    #    metrics, new_time - last_step_completion, per_device_tflops, learning_rate_schedule(step), per_device_tokens
-    #)
+    record_scalar_metrics(
+        metrics, new_time - last_step_completion, per_device_tflops, learning_rate_schedule(step), per_device_tokens
+    )
     last_step_completion = new_time
 
     if checkpoint_manager is not None:

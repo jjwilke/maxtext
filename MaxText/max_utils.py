@@ -98,15 +98,13 @@ def summarize_size_from_pytree(params):
 def initialize_summary_writer(config):
   return (
       writer.SummaryWriter(config.tensorboard_dir)
-      #if jax.process_index() == 0
-      if False
+      if jax.process_index() == 0
       else None
   )
 
 
 def close_summary_writer(summary_writer):
-  #if jax.process_index() == 0:
-  if False:
+  if jax.process_index() == 0:
     summary_writer.close()
 
 
@@ -233,13 +231,6 @@ def maybe_initialize_jax_distributed_system(raw_keys):
     else:
       initialize_jax_for_tpu_with_emergency_checkpointing(raw_keys)
     max_logging.log("Jax distributed system initialized!")
-
-  max_logging.log(f"JAX process: {jax.process_index()} / {jax.process_count()}")
-  max_logging.log(f"JAX devices: {jax.devices()}")
-  max_logging.log(f"jax.device_count(): {jax.device_count()}")
-  max_logging.log(f"jax.local_device_count(): {jax.local_device_count()}")
-  max_logging.log(f"jax.process_count(): {jax.process_count()}")
-
 
 def initialize_jax_for_gpu():
   """Jax distributed initialize for GPUs."""
@@ -433,11 +424,6 @@ def create_device_mesh(config, devices=None):
       )
 
   max_logging.log(f"Num_devices: {num_devices}, shape {mesh.shape}")
-
-  print(f"MFR: num_slices={num_slices}")
-  print(f"MFR: dcn_parallelism={dcn_parallelism}")
-  print(f"MFR: ici_parallelism={ici_parallelism}")
-  print(f"MFR: mesh={mesh}")
 
   return mesh
 
