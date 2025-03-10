@@ -64,7 +64,6 @@ from layers import quantizations
 
 from ml_goodput_measurement import goodput
 from ml_goodput_measurement import monitoring
-from praxis import trees
 
 # pylint: disable=too-many-positional-arguments
 

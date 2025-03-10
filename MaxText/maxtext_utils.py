@@ -82,7 +82,7 @@ def jit_and_compile(
 
   sharding_str_arr = []
   def check(inp, inp_sharding, out):
-    sharding_str_arr.append(f"{inp.shape} {inp.sharding} {out}")
+    sharding_str_arr.append(f"shape={inp.shape} input={inp_sharding} output={out}")
     if not inp_sharding.is_equivalent_to(out, len(inp.shape)):
       raise Exception("\n".join(sharding_str_arr) + " mismatch")
 
